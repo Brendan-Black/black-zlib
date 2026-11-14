@@ -34,4 +34,8 @@ system's `gzip` both ways, and skips itself where gzip isn't installed (as on Wi
 links it: git's loose objects at every level must decompress here, and git must read and
 `fsck` the streams compressed here. It skips itself where git isn't installed. Run it with
 `-- --nocapture` to print our sizes against zlib's at each level.
-From WSL, `winrun --test` builds the tests and runs them on Windows.
+They also run on Windows (from WSL, cross-build them with [cargo-xwin](https://github.com/rust-cross/cargo-xwin) and run them there).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
