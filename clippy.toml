@@ -1,0 +1,2 @@
+# black-rust: lint settings. Owned by cargo black; edit it in black-rust, not here.
+allow-unwrap-in-tests = true
