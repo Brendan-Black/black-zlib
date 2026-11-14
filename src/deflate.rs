@@ -8,6 +8,11 @@
 use crate::{Error, Result};
 
 /// How hard [`deflate`] (and the zlib and gzip `compress` functions) look for repeats.
+///
+/// `Fast`, `Default` and `Best` are the three named presets. `Level` takes zlib's numeric
+/// scale, the one tools like git configure: `Level(0)` stores the data uncompressed, and
+/// `Level(1)` to `Level(9)` run from quickest to smallest, searching the way zlib's levels
+/// of the same number do. Levels above 9 count as 9.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Compression {
     /// Quickest: the first few candidates, no lazy matching.
@@ -16,15 +21,64 @@ pub enum Compression {
     Default,
     /// Smallest output: longer searches.
     Best,
+    /// zlib's numeric level: 0 (stored, no compression) to 9 (smallest).
+    Level(u8),
+}
+
+/// How the matcher searches at one level.
+#[derive(Clone, Copy)]
+struct Params {
+    /// Candidates to try per position.
+    max_chain: usize,
+    /// Lazy matching, tried when the match found is shorter than this; `None` is greedy.
+    max_lazy: Option<usize>,
+    /// Stop searching once a match is this long.
+    nice: usize,
 }
 
 impl Compression {
-    /// (candidates to try per position, lazy matching, stop at a match this long)
-    fn params(self) -> (usize, bool, usize) {
+    /// True when the data is to be stored as is, with no search at all.
+    fn stored(self) -> bool {
+        self == Compression::Level(0)
+    }
+
+    fn params(self) -> Params {
+        let p = |max_chain, max_lazy, nice| Params { max_chain, max_lazy, nice };
         match self {
-            Compression::Fast => (8, false, 32),
-            Compression::Default => (128, true, 128),
-            Compression::Best => (1024, true, MAX_MATCH),
+            Compression::Fast => p(8, None, 32),
+            Compression::Default => p(128, Some(32), 128),
+            Compression::Best => p(1024, Some(32), MAX_MATCH),
+            // After zlib's configuration table (deflate.c): its chain and nice lengths, and
+            // its lazy-match limits for the levels that match lazily. Level 0 never searches.
+            Compression::Level(0 | 1) => p(4, None, 8),
+            Compression::Level(2) => p(8, None, 16),
+            Compression::Level(3) => p(32, None, 32),
+            Compression::Level(4) => p(16, Some(4), 16),
+            Compression::Level(5) => p(32, Some(16), 32),
+            Compression::Level(6) => p(128, Some(16), 128),
+            Compression::Level(7) => p(256, Some(32), 128),
+            Compression::Level(8) => p(1024, Some(128), MAX_MATCH),
+            Compression::Level(_) => p(4096, Some(MAX_MATCH), MAX_MATCH),
+        }
+    }
+
+    /// The 2-bit level hint in a zlib header (0 quickest to 3 smallest), set as zlib sets it.
+    pub(crate) fn zlib_hint(self) -> u8 {
+        match self {
+            Compression::Fast | Compression::Level(0 | 1) => 0,
+            Compression::Level(2..=5) => 1,
+            Compression::Default | Compression::Level(6) => 2,
+            Compression::Best | Compression::Level(_) => 3,
+        }
+    }
+
+    /// gzip's XFL byte: 4 for the quickest level, 2 for the smallest, otherwise 0, as gzip
+    /// sets it.
+    pub(crate) fn gzip_xfl(self) -> u8 {
+        match self {
+            Compression::Fast | Compression::Level(1) => 4,
+            Compression::Best | Compression::Level(9..) => 2,
+            _ => 0,
         }
     }
 }
@@ -72,18 +126,22 @@ const BLOCK_SYMBOLS: usize = 1 << 15;
 /// Compress `data` into raw deflate data, with no zlib wrapper.
 pub fn deflate(data: &[u8], level: Compression) -> Vec<u8> {
     let mut w = BitWriter::default();
+    if level.stored() {
+        write_stored(&mut w, data, true);
+        return w.finish();
+    }
     let mut m = Matcher::new(data, level);
     let mut syms = Vec::with_capacity(BLOCK_SYMBOLS);
     let mut block_start = 0;
     let mut i = 0;
-    let (_, lazy, _) = level.params();
+    let max_lazy = level.params().max_lazy;
     while i < data.len() {
         let (len, dist) = m.find(i);
         m.insert(i);
         if len >= MIN_MATCH {
             // Lazy matching: if the next position starts a longer match, take this byte
             // as a literal instead.
-            if lazy && len < 32 && i + 1 < data.len() && m.find(i + 1).0 > len {
+            if max_lazy.is_some_and(|max| len < max) && i + 1 < data.len() && m.find(i + 1).0 > len {
                 syms.push(Symbol { len: data[i] as u16, dist: 0 });
                 i += 1;
             } else {
@@ -124,7 +182,7 @@ struct Matcher<'a> {
 
 impl<'a> Matcher<'a> {
     fn new(data: &'a [u8], level: Compression) -> Self {
-        let (max_chain, _, good_enough) = level.params();
+        let Params { max_chain, nice: good_enough, .. } = level.params();
         Matcher { data, head: vec![NONE; 1 << HASH_BITS], prev: vec![NONE; WINDOW], max_chain, good_enough }
     }
 
@@ -207,15 +265,7 @@ fn write_block(w: &mut BitWriter, syms: &[Symbol], raw: &[u8], last: bool) {
     let stored_bits = raw.len().div_ceil(65535).max(1) * (3 + 7 + 32) + raw.len() * 8;
 
     if stored_bits < dynamic_bits.min(fixed_bits) {
-        let chunks: Vec<&[u8]> = if raw.is_empty() { vec![raw] } else { raw.chunks(65535).collect() };
-        for (k, chunk) in chunks.iter().enumerate() {
-            w.bits((last && k == chunks.len() - 1) as u32, 1);
-            w.bits(0, 2);
-            w.align();
-            w.bits(chunk.len() as u32, 16);
-            w.bits(!(chunk.len() as u32) & 0xFFFF, 16);
-            w.bytes(chunk);
-        }
+        write_stored(w, raw, last);
     } else if fixed_bits <= dynamic_bits {
         w.bits(last as u32, 1);
         w.bits(1, 2);
@@ -225,6 +275,19 @@ fn write_block(w: &mut BitWriter, syms: &[Symbol], raw: &[u8], last: bool) {
         w.bits(2, 2);
         header.write(w);
         write_data(w, syms, &lit_lens, &dist_lens);
+    }
+}
+
+/// Write `raw` as stored blocks of up to 65535 bytes each (one empty block if it's empty).
+fn write_stored(w: &mut BitWriter, raw: &[u8], last: bool) {
+    let chunks: Vec<&[u8]> = if raw.is_empty() { vec![raw] } else { raw.chunks(65535).collect() };
+    for (k, chunk) in chunks.iter().enumerate() {
+        w.bits((last && k == chunks.len() - 1) as u32, 1);
+        w.bits(0, 2);
+        w.align();
+        w.bits(chunk.len() as u32, 16);
+        w.bits(!(chunk.len() as u32) & 0xFFFF, 16);
+        w.bytes(chunk);
     }
 }
 
@@ -491,8 +554,9 @@ pub fn inflate(data: &[u8], max_len: usize) -> Result<Vec<u8>> {
     inflate_counted(data, max_len).map(|(out, _)| out)
 }
 
-/// Like [`inflate`], also giving how many input bytes the deflate data took up.
-pub(crate) fn inflate_counted(data: &[u8], max_len: usize) -> Result<(Vec<u8>, usize)> {
+/// Like [`inflate`], also giving how many input bytes the deflate data took up, so a caller
+/// can find what follows it (as in a git pack, which doesn't record compressed lengths).
+pub fn inflate_counted(data: &[u8], max_len: usize) -> Result<(Vec<u8>, usize)> {
     let mut r = BitReader { data, pos: 0, buf: 0, n: 0 };
     let mut out = Vec::new();
     loop {
@@ -716,9 +780,49 @@ impl BitReader<'_> {
     }
 }
 
+/// The named presets and every numeric level, for tests to loop over.
+#[cfg(test)]
+pub(crate) fn every_level() -> Vec<Compression> {
+    let mut levels = vec![Compression::Fast, Compression::Default, Compression::Best];
+    levels.extend((0..=10).map(Compression::Level));
+    levels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_zero_stores() {
+        let data = noise(200_000, 5);
+        let raw = deflate(&data, Compression::Level(0));
+        // Four stored blocks, 5 header bytes each.
+        assert_eq!(raw.len(), data.len() + 4 * 5);
+        assert_eq!(inflate(&raw, data.len()).unwrap(), data);
+        assert_eq!(deflate(b"", Compression::Level(0)), [0x01, 0x00, 0x00, 0xFF, 0xFF]);
+        // Even repeats aren't searched for.
+        assert_eq!(deflate(&[7; 1000], Compression::Level(0)).len(), 1005);
+    }
+
+    #[test]
+    fn higher_levels_are_no_bigger() {
+        let text: Vec<u8> = (0..3000u32).flat_map(|i| format!("line {} of {}; ", i % 97, i % 13).into_bytes()).collect();
+        for data in [screenish(300, 200), text] {
+            let sizes: Vec<usize> = (1..=9).map(|n| deflate(&data, Compression::Level(n)).len()).collect();
+            // Allow a little noise between neighbouring levels, but the ends must be ordered.
+            assert!(sizes[8] <= sizes[0], "level sizes {sizes:?}");
+            assert!(sizes[8] < data.len() / 4, "level sizes {sizes:?} of {}", data.len());
+        }
+        assert_eq!(deflate(b"x", Compression::Level(200)), deflate(b"x", Compression::Level(9)));
+    }
+
+    #[test]
+    fn counts_what_it_used() {
+        let mut d = deflate(b"hello hello hello", Compression::Default);
+        let len = d.len();
+        d.extend(b"trailing");
+        assert_eq!(inflate_counted(&d, 100).unwrap(), (b"hello hello hello".to_vec(), len));
+    }
 
     /// Deterministic noise, which doesn't compress.
     fn noise(len: usize, mut seed: u64) -> Vec<u8> {
@@ -771,7 +875,7 @@ mod tests {
 
     #[test]
     fn round_trips_at_every_level() {
-        for level in [Compression::Fast, Compression::Default, Compression::Best] {
+        for level in crate::deflate::every_level() {
             for (name, data) in samples() {
                 let raw = deflate(&data, level);
                 assert_eq!(inflate(&raw, data.len()).as_deref(), Ok(&data[..]), "{name} at {level:?}");

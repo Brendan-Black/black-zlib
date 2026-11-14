@@ -14,11 +14,7 @@ const RESERVED: u8 = 0xE0;
 
 /// Compress `data` into gzip data, with no file name and no time.
 pub fn compress(data: &[u8], level: Compression) -> Vec<u8> {
-    let xfl = match level {
-        Compression::Fast => 4,
-        Compression::Default => 0,
-        Compression::Best => 2,
-    };
+    let xfl = level.gzip_xfl();
     // Magic, deflate, no flags, no time, the level hint, "unknown" operating system.
     let mut out = vec![MAGIC[0], MAGIC[1], 8, 0, 0, 0, 0, 0, xfl, 255];
     out.extend(deflate(data, level));
@@ -102,7 +98,7 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        for level in [Compression::Fast, Compression::Default, Compression::Best] {
+        for level in crate::deflate::every_level() {
             for data in [&b""[..], b"x", &b"hello ".repeat(5000)] {
                 assert_eq!(decompress(&compress(data, level), data.len()).as_deref(), Ok(data));
             }
