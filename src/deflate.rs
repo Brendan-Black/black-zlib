@@ -555,6 +555,19 @@ pub fn inflate(data: &[u8], max_len: usize) -> Result<Vec<u8>> {
 /// Like [`inflate`], also giving how many input bytes the deflate data took up, so a caller
 /// can find what follows it (as in a git pack, which doesn't record compressed lengths).
 pub fn inflate_counted(data: &[u8], max_len: usize) -> Result<(Vec<u8>, usize)> {
+	inflate_until(data, max_len, usize::MAX)
+}
+
+/// At least the first `want` bytes the deflate data decompresses to (all of them, if there
+/// are fewer), decoding no further than that: enough to read a header at the start of a large
+/// stream without decompressing the rest. Errors past the point where it stops go unnoticed.
+pub fn inflate_prefix(data: &[u8], want: usize, max_len: usize) -> Result<Vec<u8>> {
+	inflate_until(data, max_len, want).map(|(out, _)| out)
+}
+
+/// Decompress until the data ends or at least `stop` bytes are out, giving the bytes and how
+/// many input bytes were read.
+fn inflate_until(data: &[u8], max_len: usize, stop: usize) -> Result<(Vec<u8>, usize)> {
 	let mut r = BitReader { data, pos: 0, buf: 0, n: 0 };
 	let mut out = Vec::new();
 	loop {
@@ -575,15 +588,15 @@ pub fn inflate_counted(data: &[u8], max_len: usize) -> Result<(Vec<u8>, usize)> 
 			1 => {
 				let lit = Huffman::new(&fixed_lit_lengths())?.0;
 				let dist = Huffman::new(&FIXED_DIST_LENGTHS)?.0;
-				inflate_block(&mut r, &mut out, &lit, &dist, max_len)?;
+				inflate_block(&mut r, &mut out, &lit, &dist, max_len, stop)?;
 			}
 			2 => {
 				let (lit, dist) = read_dynamic_codes(&mut r)?;
-				inflate_block(&mut r, &mut out, &lit, &dist, max_len)?;
+				inflate_block(&mut r, &mut out, &lit, &dist, max_len, stop)?;
 			}
 			_ => return Err(Error::corrupt("unknown deflate block type 3")),
 		}
-		if last {
+		if last || out.len() >= stop {
 			return Ok((out, r.pos));
 		}
 	}
@@ -644,8 +657,12 @@ fn huffman_allowing_single(lens: &[u8]) -> Result<Huffman> {
 	Ok(h)
 }
 
-fn inflate_block(r: &mut BitReader, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, max_len: usize) -> Result<()> {
+/// Decode one block into `out`, returning early once it holds at least `stop` bytes.
+fn inflate_block(r: &mut BitReader, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, max_len: usize, stop: usize) -> Result<()> {
 	loop {
+		if out.len() >= stop {
+			return Ok(());
+		}
 		let sym = lit.decode(r)? as usize;
 		if sym < 256 {
 			if out.len() >= max_len {

@@ -2,7 +2,7 @@
 //! as PNG stores its pixels.
 
 use crate::checksum::adler32;
-use crate::deflate::{Compression, deflate, inflate_counted};
+use crate::deflate::{Compression, deflate, inflate_counted, inflate_prefix};
 use crate::{Error, Result};
 
 /// Compress `data` into a zlib stream.
@@ -28,6 +28,27 @@ pub fn decompress(data: &[u8], max_len: usize) -> Result<Vec<u8>> {
 /// and checksum included, so a caller can find what follows it. Git's packs need this: they
 /// record each object's size uncompressed, but not where its zlib stream ends.
 pub fn decompress_counted(data: &[u8], max_len: usize) -> Result<(Vec<u8>, usize)> {
+	check_header(data)?;
+	let (out, used) = inflate_counted(&data[2..], max_len)?;
+	let Some(sum) = data[2 + used..].first_chunk::<4>() else {
+		return Err(Error::corrupt("the zlib stream is missing its checksum"));
+	};
+	if u32::from_be_bytes(*sum) != adler32(&out) {
+		return Err(Error::corrupt("the zlib checksum doesn't match"));
+	}
+	Ok((out, 2 + used + 4))
+}
+
+/// At least the first `want` bytes of a zlib stream (all of them, if there are fewer),
+/// decompressing no further: enough to read a header at the start of a large stream, as git
+/// reads a delta's sizes. Checks the header but not the checksum, which it doesn't reach.
+pub fn decompress_prefix(data: &[u8], want: usize, max_len: usize) -> Result<Vec<u8>> {
+	check_header(data)?;
+	inflate_prefix(&data[2..], want, max_len)
+}
+
+/// That `data` starts with a zlib header this can decompress.
+fn check_header(data: &[u8]) -> Result<()> {
 	let [cmf, flg, ..] = *data else {
 		return Err(Error::corrupt("the zlib stream is cut short"));
 	};
@@ -40,14 +61,7 @@ pub fn decompress_counted(data: &[u8], max_len: usize) -> Result<(Vec<u8>, usize
 	if flg & 0x20 != 0 {
 		return Err(Error::corrupt("the zlib stream needs a preset dictionary"));
 	}
-	let (out, used) = inflate_counted(&data[2..], max_len)?;
-	let Some(sum) = data[2 + used..].first_chunk::<4>() else {
-		return Err(Error::corrupt("the zlib stream is missing its checksum"));
-	};
-	if u32::from_be_bytes(*sum) != adler32(&out) {
-		return Err(Error::corrupt("the zlib checksum doesn't match"));
-	}
-	Ok((out, 2 + used + 4))
+	Ok(())
 }
 
 #[cfg(test)]
@@ -61,6 +75,22 @@ mod tests {
 				assert_eq!(decompress(&compress(data, level), data.len()).as_deref(), Ok(data));
 			}
 		}
+	}
+
+	#[test]
+	fn decompresses_just_a_prefix() {
+		let data: Vec<u8> = (0..200_000u32).flat_map(|i| (i % 251).to_le_bytes()).collect();
+		for level in crate::deflate::every_level() {
+			let z = compress(&data, level);
+			for want in [0, 1, 20, 70_000] {
+				let start = decompress_prefix(&z, want, data.len()).unwrap();
+				assert!(start.len() >= want && data.starts_with(&start), "level {level:?}, want {want}");
+			}
+			assert_eq!(decompress_prefix(&z, usize::MAX, data.len()).unwrap(), data, "all of it");
+			// It stops before the end, so a cut-short stream still gives its start.
+			assert!(decompress_prefix(&z[..z.len() / 2], 20, data.len()).unwrap().len() >= 20);
+		}
+		assert!(decompress_prefix(b"not zlib", 1, 10).is_err());
 	}
 
 	#[test]
