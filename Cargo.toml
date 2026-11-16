@@ -9,7 +9,7 @@ description = "Deflate, zlib and gzip compression and decompression, with no dep
 [dependencies]
 
 [package.metadata.black]
-version = "0.2.4"
+version = "0.2.5"
 
 # black-rust: compiler and Clippy lints. Owned by cargo black; edit it in black-rust, not here.
 # Everything else is rustc's and Clippy's defaults, which `cargo black check` runs with -D warnings.
