@@ -565,11 +565,16 @@ pub fn inflate_prefix(data: &[u8], want: usize, max_len: usize) -> Result<Vec<u8
 	inflate_until(data, max_len, want).map(|(out, _)| out)
 }
 
+/// How much output to make room for at the start: all of it when the limit is the size the
+/// caller expects (as a git pack's entries give it), and no more than this when it's only a
+/// bound.
+const FIRST_RESERVE: usize = 1 << 16;
+
 /// Decompress until the data ends or at least `stop` bytes are out, giving the bytes and how
 /// many input bytes were read.
 fn inflate_until(data: &[u8], max_len: usize, stop: usize) -> Result<(Vec<u8>, usize)> {
 	let mut r = BitReader { data, pos: 0, buf: 0, n: 0 };
-	let mut out = Vec::new();
+	let mut out = Vec::with_capacity(max_len.min(stop).min(FIRST_RESERVE));
 	loop {
 		let last = r.bits(1)? == 1;
 		match r.bits(2)? {
@@ -586,9 +591,8 @@ fn inflate_until(data: &[u8], max_len: usize, stop: usize) -> Result<(Vec<u8>, u
 				out.extend_from_slice(bytes);
 			}
 			1 => {
-				let lit = Huffman::new(&fixed_lit_lengths())?.0;
-				let dist = Huffman::new(&FIXED_DIST_LENGTHS)?.0;
-				inflate_block(&mut r, &mut out, &lit, &dist, max_len, stop)?;
+				let (lit, dist) = fixed_codes();
+				inflate_block(&mut r, &mut out, lit, dist, max_len, stop)?;
 			}
 			2 => {
 				let (lit, dist) = read_dynamic_codes(&mut r)?;
@@ -597,9 +601,20 @@ fn inflate_until(data: &[u8], max_len: usize, stop: usize) -> Result<(Vec<u8>, u
 			_ => return Err(Error::corrupt("unknown deflate block type 3")),
 		}
 		if last || out.len() >= stop {
-			return Ok((out, r.pos));
+			return Ok((out, r.used()));
 		}
 	}
+}
+
+/// The fixed codes, built once.
+fn fixed_codes() -> (&'static Huffman, &'static Huffman) {
+	static FIXED: std::sync::OnceLock<(Huffman, Huffman)> = std::sync::OnceLock::new();
+	let (lit, dist) = FIXED.get_or_init(|| {
+		let lit = Huffman::new(&fixed_lit_lengths()).expect("the fixed literal code is valid").0;
+		let dist = Huffman::new(&FIXED_DIST_LENGTHS).expect("the fixed distance code is valid").0;
+		(lit, dist)
+	});
+	(lit, dist)
 }
 
 fn read_dynamic_codes(r: &mut BitReader) -> Result<(Huffman, Huffman)> {
@@ -617,7 +632,8 @@ fn read_dynamic_codes(r: &mut BitReader) -> Result<(Huffman, Huffman)> {
 	if !complete {
 		return Err(Error::corrupt("incomplete code-length code"));
 	}
-	let mut lens = vec![0u8; hlit + hdist];
+	let mut lens = [0u8; 286 + 30];
+	let lens = &mut lens[..hlit + hdist];
 	let mut i = 0;
 	while i < lens.len() {
 		let sym = cl.decode(r)?;
@@ -693,20 +709,38 @@ fn inflate_block(r: &mut BitReader, out: &mut Vec<u8>, lit: &Huffman, dist: &Huf
 		let start = out.len() - d;
 		if d >= len {
 			out.extend_from_within(start..start + len);
+		} else if d == 1 {
+			let b = out[start];
+			out.resize(out.len() + len, b);
 		} else {
-			// Overlapping: each copied byte can be the source of a later one.
-			for k in 0..len {
-				out.push(out[start + k]);
+			// Overlapping: the repeat is the last `d` bytes over and over.
+			let mut left = len;
+			while left > 0 {
+				let n = left.min(d);
+				out.extend_from_within(start..start + n);
+				left -= n;
 			}
 		}
 	}
 }
 
-/// A canonical Huffman code for decoding: how many codes each length has, and the symbols
-/// in code order.
+/// How many bits of a code [`Huffman::decode`] looks up at once; longer codes are decoded a
+/// bit at a time past these.
+const TABLE_BITS: u32 = 10;
+/// The longest code the format allows.
+const MAX_CODE_BITS: u32 = 15;
+
+/// A canonical Huffman code for decoding: how many codes each length has, the symbols in code
+/// order, and a table of the codes no longer than [`TABLE_BITS`], as zlib's inflate keeps one.
 struct Huffman {
 	count: [u16; 16],
 	symbols: Vec<u16>,
+	/// By the next `table_bits` bits of input: the symbol a code of that many bits or fewer
+	/// starts with them (shifted up 4) and the code's length (the low 4 bits), or 0 if no code
+	/// that short does.
+	table: Vec<u16>,
+	/// `TABLE_BITS`, or fewer if no code is that long.
+	table_bits: u32,
 }
 
 impl Huffman {
@@ -734,53 +768,130 @@ impl Huffman {
 				offset[l as usize] += 1;
 			}
 		}
-		Ok((Huffman { count, symbols }, left == 0))
+		// Each short code, its bits reversed (the input is read lowest bit first), fills every
+		// entry whose low bits are it. The table is built a length at a time, as libdeflate
+		// builds its: doubled, which repeats each shorter code's entries, then each code of
+		// the new length put in its one place.
+		let longest = (1..=MAX_CODE_BITS).rev().find(|&l| count[l as usize] != 0).unwrap_or(1);
+		let table_bits = longest.min(TABLE_BITS);
+		let mut table = Vec::with_capacity(1 << table_bits);
+		table.extend_from_slice(&[0u16; 2]);
+		let mut code = 0u32;
+		let mut index = 0usize;
+		for len in 1..=table_bits {
+			if len > 1 {
+				table.extend_from_within(..);
+			}
+			for _ in 0..count[len as usize] {
+				let reversed = code.reverse_bits() >> (32 - len);
+				table[reversed as usize] = symbols[index] << 4 | len as u16;
+				code += 1;
+				index += 1;
+			}
+			code <<= 1;
+		}
+		Ok((Huffman { count, symbols, table, table_bits }, left == 0))
 	}
 
+	#[inline]
 	fn decode(&self, r: &mut BitReader) -> Result<u16> {
+		r.fill(MAX_CODE_BITS);
+		let entry = self.table[(r.buf & ((1 << self.table_bits) - 1)) as usize];
+		if entry != 0 {
+			r.consume(u32::from(entry & 15))?;
+			return Ok(entry >> 4);
+		}
+		self.decode_long(r)
+	}
+
+	/// A code longer than the table holds (or not a code at all), a bit at a time.
+	fn decode_long(&self, r: &mut BitReader) -> Result<u16> {
 		let (mut code, mut first, mut index) = (0i32, 0i32, 0i32);
-		for &count in &self.count[1..] {
-			code |= r.bits(1)? as i32;
-			let count = count as i32;
+		for len in 1..=MAX_CODE_BITS {
+			code |= ((r.buf >> (len - 1)) & 1) as i32;
+			let count = self.count[len as usize] as i32;
 			if code - first < count {
+				r.consume(len)?;
 				return Ok(self.symbols[(index + code - first) as usize]);
 			}
 			index += count;
 			first = (first + count) << 1;
 			code <<= 1;
 		}
+		if r.n < MAX_CODE_BITS {
+			return Err(cut_short());
+		}
 		Err(Error::corrupt("a code that isn't in the Huffman code"))
 	}
 }
 
-/// Reads bits from the lowest bit of each byte up, taking bytes only as it needs them, so
-/// after `align` the next unread byte is exactly at `pos`.
+fn cut_short() -> Error {
+	Error::corrupt("the deflate data is cut short")
+}
+
+/// Reads bits from the lowest bit of each byte up, a word at a time. `buf` holds `n` bits not
+/// yet read; any bits above them are the input's next bits too, or zeros past its end.
 struct BitReader<'a> {
 	data: &'a [u8],
+	/// The next byte not yet in `buf`.
 	pos: usize,
-	buf: u32,
+	buf: u64,
 	n: u32,
 }
 
 impl BitReader<'_> {
-	fn bits(&mut self, count: u32) -> Result<u32> {
-		while self.n < count {
-			let Some(&b) = self.data.get(self.pos) else {
-				return Err(Error::corrupt("the deflate data is cut short"));
-			};
-			self.buf |= (b as u32) << self.n;
+	/// Make `buf` hold at least `want` bits (at most 56), if there are that many left.
+	#[inline]
+	fn fill(&mut self, want: u32) {
+		if self.n >= want {
+			return;
+		}
+		if let Some(word) = self.data.get(self.pos..self.pos + 8) {
+			let word = u64::from_le_bytes(word.try_into().expect("an 8-byte slice"));
+			self.buf |= word << self.n;
+			let bytes = (63 - self.n) / 8;
+			self.pos += bytes as usize;
+			self.n += bytes * 8;
+			return;
+		}
+		while self.n <= 56 {
+			let Some(&b) = self.data.get(self.pos) else { break };
+			self.buf |= u64::from(b) << self.n;
 			self.pos += 1;
 			self.n += 8;
 		}
-		let v = self.buf & ((1u64 << count) - 1) as u32;
-		self.buf = if count == 32 { 0 } else { self.buf >> count };
+	}
+
+	/// Drop `count` bits already looked at.
+	#[inline]
+	fn consume(&mut self, count: u32) -> Result<()> {
+		if count > self.n {
+			return Err(cut_short());
+		}
+		self.buf >>= count;
 		self.n -= count;
+		Ok(())
+	}
+
+	#[inline]
+	fn bits(&mut self, count: u32) -> Result<u32> {
+		self.fill(count);
+		let v = (self.buf & ((1u64 << count) - 1)) as u32;
+		self.consume(count)?;
 		Ok(v)
 	}
 
+	/// Skip to the next byte boundary, and give back the whole bytes read ahead, so the next
+	/// unread byte is at `pos`.
 	fn align(&mut self) {
+		self.pos -= (self.n / 8) as usize;
 		self.buf = 0;
 		self.n = 0;
+	}
+
+	/// How many input bytes have been read, a byte partly read counting as read.
+	fn used(&self) -> usize {
+		self.pos - (self.n / 8) as usize
 	}
 
 	fn take(&mut self, len: usize) -> Result<&[u8]> {
@@ -938,6 +1049,33 @@ mod tests {
 		assert_eq!(inflate(&z, 1 << 20).map(|v| v.len()), Ok(1 << 20));
 		let s = deflate(&noise(5000, 9), Compression::Default);
 		assert_eq!(inflate(&s, 4999), Err(Error::TooLarge { limit: 4999 }));
+	}
+
+	#[test]
+	fn decodes_codes_longer_than_the_table() {
+		// Byte k appears about 1.6^k times, so the rarest get codes of 15 bits, past what
+		// the decoder's table holds; the noise keeps them literals.
+		let mut data = Vec::new();
+		let mut weight = 1.0f64;
+		for byte in 0..24u8 {
+			data.extend(std::iter::repeat_n(byte, weight as usize));
+			weight *= 1.6;
+		}
+		let order = noise(data.len(), 11);
+		let mut keyed: Vec<(u8, u8)> = order.into_iter().zip(data).collect();
+		keyed.sort_unstable();
+		let data: Vec<u8> = keyed.into_iter().map(|(_, b)| b).collect();
+		let mut freq = [0u32; 286];
+		for &b in &data {
+			freq[b as usize] += 1;
+		}
+		assert!(code_lengths(&freq, 15).iter().any(|&l| u32::from(l) > TABLE_BITS));
+		let raw = deflate(&data, Compression::Fast);
+		assert_eq!(inflate(&raw, data.len()).as_deref(), Ok(&data[..]));
+		// Cut anywhere, it's an error and never a panic.
+		for end in (0..raw.len()).step_by(97) {
+			assert!(inflate(&raw[..end], data.len()).is_err());
+		}
 	}
 
 	#[test]
