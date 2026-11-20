@@ -776,19 +776,24 @@ impl Huffman {
 		let table_bits = longest.min(TABLE_BITS);
 		let mut table = Vec::with_capacity(1 << table_bits);
 		table.extend_from_slice(&[0u16; 2]);
-		let mut code = 0u32;
+		// The next code, kept reversed and counted up from its top bit, as zlib's
+		// inflate_table counts: a longer code is the shorter one with a 0 after it, which
+		// reversed is the same number.
+		let mut reversed = 0usize;
 		let mut index = 0usize;
 		for len in 1..=table_bits {
 			if len > 1 {
 				table.extend_from_within(..);
 			}
 			for _ in 0..count[len as usize] {
-				let reversed = code.reverse_bits() >> (32 - len);
-				table[reversed as usize] = symbols[index] << 4 | len as u16;
-				code += 1;
+				table[reversed] = symbols[index] << 4 | len as u16;
 				index += 1;
+				let mut step = 1 << (len - 1);
+				while reversed & step != 0 {
+					step >>= 1;
+				}
+				reversed = if step == 0 { 0 } else { (reversed & (step - 1)) + step };
 			}
-			code <<= 1;
 		}
 		Ok((Huffman { count, symbols, table, table_bits }, left == 0))
 	}
